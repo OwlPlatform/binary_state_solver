@@ -183,7 +183,24 @@ int main(int arg_count, char** arg_vector) {
               pushBackVal<uint8_t>(switch_on ? 1 : 0, soln.data);
               std::vector<SolverWorldModel::AttrUpdate> solns{soln};
               //Send the data to the world model
-              swm.sendData(solns, false);
+              bool retry = true;
+              while (retry) {
+                try {
+                  retry = false;
+                  swm.sendData(solns, false);
+                }
+                catch (std::runtime_error& err) {
+                  //Retry if this is just 
+                  if (err.what() == std::string("Error sending data over socket: Resource temporarily unavailable")) {
+                    std::cerr<<"Experiencing socket slow down with world model connection. Retrying...\n";
+                    retry = true;
+                  }
+                  //Otherwise keep throwing
+                  else {
+                    throw err;
+                  }
+                }
+              }
               if (switch_on) {
                 std::cout<<toString(uri)<<" is "<<toString(obj_soln->second)<<'\n';
               } else {
