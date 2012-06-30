@@ -244,6 +244,7 @@ int main(int arg_count, char** arg_vector) {
 
       std::vector<Transmitter>& phy_txers = phy_to_rule[tx_switch.phy].txers;
       if (phy_txers.end() == std::find_if(phy_txers.begin(), phy_txers.end(), tx_present)) {
+        std::cerr<<"Requesting aggregator data for new transmitter "<<tx_switch.id<<" on device "<<toString(I.first)<<'\n';
         //Mark that we are making a change to the aggregator rules.
         new_transmitters = true;
         //Only accept data from sensors that we care about
