@@ -22,7 +22,7 @@ ENDIF(NOT OWL_INC_DIR)
 
 include_directories ("${OWL_INC_DIR}")
 
-add_subdirectory (src)
+add_subdirectory (src bin)
 
 #Set the correct library directory suffix
 if(NOT DEFINED LIB_SUFFIX)
