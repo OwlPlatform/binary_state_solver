@@ -108,7 +108,7 @@ int main(int arg_count, char** arg_vector) {
   int client_port = std::stoi(std::string((arg_vector[arg_count - 2])));
 
   //Set up the solver world model connection;
-  std::string origin = "grail/switch_solver\nversion 1.0";
+  std::string origin = "binary_state_solver";
 
   //Read in type information from the config file
   //Types for the GRAIL world model will be read from the file
