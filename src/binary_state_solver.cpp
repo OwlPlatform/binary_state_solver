@@ -305,6 +305,9 @@ int main(int arg_count, char** arg_vector) {
       std::cerr<<"Sending new rules to the aggregator.\n";
       aggregator.addRules(sub);
     }
+    //Clear the phy_to_rule map since the solver aggregator interface
+    //now remembers this rule.
+    phy_to_rule.clear();
   }
 }
 
