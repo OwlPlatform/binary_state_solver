@@ -33,9 +33,13 @@
 #include <map>
 #include <string>
 #include <time.h>
+#include <unistd.h>
 #include <utility>
 #include <vector>
 #include <sstream>
+
+//Handle interrupt signals to exit cleanly.
+#include <signal.h>
 
 #include <owl/netbuffer.hpp>
 #include <owl/solver_aggregator_connection.hpp>
@@ -54,16 +58,18 @@ using world_model::Attribute;
 using world_model::grail_time;
 using world_model::URI;
 
-struct Debug {
-  bool on;
-};
-
-template<typename T>
-Debug& operator<<(Debug& dbg, T arg) {
-  if (dbg.on) {
-    std::cout<<arg;
+//Global variable for the signal handler.
+bool interrupted = false;
+//Signal handler.
+void handler(int signal) {
+  psignal( signal, "Received signal ");
+  if (interrupted) {
+    std::cerr<<"Aborting.\n";
+    // This is the second time we've received the interrupt, so just exit.
+    exit(-1);
   }
-  return dbg;
+  std::cerr<<"Shutting down...\n";
+  interrupted = true;
 }
 
 std::u16string toU16(const std::string& str) {
@@ -93,6 +99,9 @@ int main(int arg_count, char** arg_vector) {
     std::cerr<<"For instance: \"doors\" \"closed\"\n";
     return 0;
   }
+
+  //Set up a signal handler to catch interrupt signals so we can close gracefully
+  signal(SIGINT, handler);  
 
   //Grab the ip and ports for the aggregators and world model
   std::vector<SolverAggregator::NetTarget> servers;
@@ -160,32 +169,6 @@ int main(int arg_count, char** arg_vector) {
     return 0;
   }
 
-  std::cerr<<"Trying to connect to world model as a client.\n";
-  ClientWorldConnection cwc(wm_ip, client_port);
-
-  //Search for any IDs with names <anything>.obj_class.<anything>
-  URI desired_ids = u".*\\.";
-  if (object_to_solution.size() == 1) {
-    desired_ids = u".*\\." + object_to_solution.begin()->first + u"\\..*";
-  }
-  else {
-    desired_ids += u"(";
-    for (auto I = object_to_solution.begin(); I != object_to_solution.end(); ++I) {
-      //Insert a | (OR in regex) into the regex if this isn't the first object
-      if (I != object_to_solution.begin()) {
-        desired_ids += u"|";
-      }
-      desired_ids += I->first;
-    }
-    desired_ids += u")";
-  }
-  desired_ids += u"\\..*";
-
-  //Search for any matching IDs with switch sensors
-  std::vector<URI> attributes{u"sensor.switch.*"};
-  //Update at most once a second
-  world_model::grail_time interval = 1000;
-  StepResponse sr = cwc.streamRequest(desired_ids, attributes, interval);
 
   //Subscription rules for the GRAIL aggregator
   //The transmitters to request will be discovered from the world model
@@ -245,69 +228,114 @@ int main(int arg_count, char** arg_vector) {
   };
   SolverAggregator aggregator(servers, packet_callback);
 
-  //Less than operator for two world model attributes
-  auto attr_comp = [](const Attribute& a, const Attribute& b) {
-    return (a.expiration_date != 0 or a.creation_date < b.creation_date); };
-  std::cerr<<"Starting processing loop...\n";
-  while (sr.hasNext()) {
-    //Remember if we need to ask the aggregator for more information.
-    bool new_transmitters = false;
-    //Get world model updates
-    world_model::WorldState ws = sr.next();
-    //Check each object for switch sensor ID information
-    for (const std::pair<URI, std::vector<Attribute>>& I : ws) {
-      if (I.second.empty()) {
-        std::cerr<<toString(I.first)<<" is an empty object.\n";
+
+  //Now handle connecting as a client.
+  //Search for any IDs with names <anything>.obj_class.<anything>
+  URI desired_ids = u".*\\.";
+  if (object_to_solution.size() == 1) {
+    desired_ids = u".*\\." + object_to_solution.begin()->first + u"\\..*";
+  }
+  else {
+    desired_ids += u"(";
+    for (auto I = object_to_solution.begin(); I != object_to_solution.end(); ++I) {
+      //Insert a | (OR in regex) into the regex if this isn't the first object
+      if (I != object_to_solution.begin()) {
+        desired_ids += u"|";
       }
-      else {
-        Attribute newest = *(std::max_element(I.second.begin(), I.second.end(), attr_comp));
-        if (newest.expiration_date != 0) {
-          //TODO FIXME This attribute has been expired so stop updating the
-          //status of this ID in the world model
-        }
-        //Otherwise, make sure that we have signed up for this sensor's data
-        //from the aggregators
+      desired_ids += I->first;
+    }
+    desired_ids += u")";
+  }
+  desired_ids += u"\\..*";
 
-        //Transmitters are stored as one byte of physical layer and 16 bytes of ID
-        grail_types::transmitter tx_switch = grail_types::readTransmitter(newest.data);
-        if (phy_to_rule.find(tx_switch.phy) == phy_to_rule.end()) {
-          phy_to_rule[tx_switch.phy].physical_layer  = tx_switch.phy;
-          phy_to_rule[tx_switch.phy].update_interval = 1000;
-        }
-        //See if this is a new transmitter
-        auto tx_present = [&](const Transmitter& tx) {return tx.base_id == tx_switch.id;};
+  //Search for any matching IDs with switch sensors
+  std::vector<URI> attributes{u"sensor.switch.*"};
+  //Update at most once a second
+  world_model::grail_time interval = 1000;
+  //We will connect to the world model as a client inside of the processing loop below
+  //Whenever we are disconnected we will attempt to reconnect.
 
-        std::vector<Transmitter>& phy_txers = phy_to_rule[tx_switch.phy].txers;
-        if (phy_txers.end() == std::find_if(phy_txers.begin(), phy_txers.end(), tx_present)) {
-          std::cerr<<"Requesting aggregator data for new transmitter "<<tx_switch.id<<" on device "<<toString(I.first)<<'\n';
-          //Mark that we are making a change to the aggregator rules.
-          new_transmitters = true;
-          //Only accept data from sensors that we care about
-          Transmitter sensor_id;
-          sensor_id.base_id = tx_switch.id;
-          sensor_id.mask.upper = 0xFFFFFFFFFFFFFFFF;
-          sensor_id.mask.lower = 0xFFFFFFFFFFFFFFFF;
-          phy_txers.push_back(sensor_id);
-          //Also map this transmitter's ID to the object it corresponds to in the world model
-          {
-            std::unique_lock<std::mutex> lck(tx_to_uri_mutex);
-            tx_to_uri[std::make_pair(tx_switch.phy, tx_switch.id)] = I.first;
+  std::cerr<<"Trying to connect to world model as a client.\n";
+  ClientWorldConnection cwc(wm_ip, client_port);
+
+  while (not interrupted) {
+    while (not cwc.connected() and not interrupted) {
+      std::cerr<<"Waiting 4 seconds before attempting to reconnect client->world model connection\n";
+      //Sleep for several seconds after an error before trying to reconnect
+      sleep(4);
+      cwc.reconnect();
+    }
+
+    //Less than operator for two world model attributes
+    auto attr_comp = [](const Attribute& a, const Attribute& b) {
+      return (a.expiration_date != 0 or a.creation_date < b.creation_date); };
+    std::cerr<<"Starting processing loop...\n";
+    try {
+      StepResponse sr = cwc.streamRequest(desired_ids, attributes, interval);
+      while (sr.hasNext() and not interrupted) {
+        //Remember if we need to ask the aggregator for more information.
+        bool new_transmitters = false;
+        //Get world model updates
+        world_model::WorldState ws = sr.next();
+        //Check each object for switch sensor ID information
+        for (const std::pair<URI, std::vector<Attribute>>& I : ws) {
+          if (I.second.empty()) {
+            std::cerr<<toString(I.first)<<" is an empty object.\n";
+          }
+          else {
+            Attribute newest = *(std::max_element(I.second.begin(), I.second.end(), attr_comp));
+            if (newest.expiration_date != 0) {
+              //TODO FIXME This attribute has been expired so stop updating the
+              //status of this ID in the world model
+            }
+            //Otherwise, make sure that we have signed up for this sensor's data
+            //from the aggregators
+
+            //Transmitters are stored as one byte of physical layer and 16 bytes of ID
+            grail_types::transmitter tx_switch = grail_types::readTransmitter(newest.data);
+            if (phy_to_rule.find(tx_switch.phy) == phy_to_rule.end()) {
+              phy_to_rule[tx_switch.phy].physical_layer  = tx_switch.phy;
+              phy_to_rule[tx_switch.phy].update_interval = 1000;
+            }
+            //See if this is a new transmitter
+            auto tx_present = [&](const Transmitter& tx) {return tx.base_id == tx_switch.id;};
+
+            std::vector<Transmitter>& phy_txers = phy_to_rule[tx_switch.phy].txers;
+            if (phy_txers.end() == std::find_if(phy_txers.begin(), phy_txers.end(), tx_present)) {
+              std::cerr<<"Requesting aggregator data for new transmitter "<<tx_switch.id<<" on device "<<toString(I.first)<<'\n';
+              //Mark that we are making a change to the aggregator rules.
+              new_transmitters = true;
+              //Only accept data from sensors that we care about
+              Transmitter sensor_id;
+              sensor_id.base_id = tx_switch.id;
+              sensor_id.mask.upper = 0xFFFFFFFFFFFFFFFF;
+              sensor_id.mask.lower = 0xFFFFFFFFFFFFFFFF;
+              phy_txers.push_back(sensor_id);
+              //Also map this transmitter's ID to the object it corresponds to in the world model
+              {
+                std::unique_lock<std::mutex> lck(tx_to_uri_mutex);
+                tx_to_uri[std::make_pair(tx_switch.phy, tx_switch.id)] = I.first;
+              }
+            }
           }
         }
+        //Make new subscriptions to the aggregator if there are new transmitters
+        if (new_transmitters) {
+          Subscription sub;
+          for (auto phy_rule : phy_to_rule) {
+            sub.push_back(phy_rule.second);
+          }
+          std::cerr<<"Sending new rules to the aggregator.\n";
+          aggregator.addRules(sub);
+        }
+        //Clear the phy_to_rule map since the solver aggregator interface
+        //now remembers this rule.
+        phy_to_rule.clear();
       }
     }
-    //Make new subscriptions to the aggregator if there are new transmitters
-    if (new_transmitters) {
-      Subscription sub;
-      for (auto phy_rule : phy_to_rule) {
-        sub.push_back(phy_rule.second);
-      }
-      std::cerr<<"Sending new rules to the aggregator.\n";
-      aggregator.addRules(sub);
+    catch (std::runtime_error& err) {
+      std::cerr<<"Error in client->world model connection: "<<err.what()<<'\n';
     }
-    //Clear the phy_to_rule map since the solver aggregator interface
-    //now remembers this rule.
-    phy_to_rule.clear();
   }
 }
 
