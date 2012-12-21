@@ -1,8 +1,13 @@
 Installation Instructions
 *************************
 
-Run the following commands to build libowl.so and install it
-in your library directory:
+You will need the C++ owl libraries to build this project.
+Get them from:
+https://github.com/OwlPlatform/cpp-owl-common
+and
+https://github.com/OwlPlatform/cpp-owl-solver
+
+Afterwards you can install this solver with cmake:
 cmake .
 make
 make install
