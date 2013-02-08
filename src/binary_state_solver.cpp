@@ -86,7 +86,6 @@ int main(int arg_count, char** arg_vector) {
     std::cout<< "arguments: aggregator agg_solver worldmodel wm_solver wm_client config_file\n";
     std::cout<< "description: Monitors status of simple on/off switches.\n";
     std::cout<< "requires: sensor\\.switch\n";
-    std::cout<< "config_file: tuple 1 Region name.\n";
     std::cout<< "config_file: tuple* 2 An item class (eg. door) and the name for its state when the switch is on (eg. closed).\n";
     return 0;
   }
