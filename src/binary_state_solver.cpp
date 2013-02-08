@@ -244,9 +244,8 @@ int main(int arg_count, char** arg_vector) {
       }
       desired_ids += I->first;
     }
-    desired_ids += u")";
+    desired_ids += u")\\..*";
   }
-  desired_ids += u"\\..*";
 
   //Search for any matching IDs with switch sensors
   std::vector<URI> attributes{u"sensor.switch.*"};
