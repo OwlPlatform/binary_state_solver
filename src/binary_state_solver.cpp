@@ -83,17 +83,16 @@ std::string toString(const std::u16string& str) {
 int main(int arg_count, char** arg_vector) {
   if (arg_count == 2 and std::string(arg_vector[1]) == "-?") {
     std::cout<< "name: Switch Solver\n";
-    std::cout<< "arguments: aggregator agg_solver worldmodel wm_solver wm_client config_file\n";
+    std::cout<< "arguments: worldmodel wm_solver wm_client config_file\n";
     std::cout<< "description: Monitors status of simple on/off switches.\n";
-    std::cout<< "requires: sensor\\.switch\n";
+    std::cout<< "requires: 'binary state'\n";
     std::cout<< "config_file: tuple* 2 An item class (eg. door) and the name for its state when the switch is on (eg. closed).\n";
     return 0;
   }
 
-  if (7 > arg_count or (arg_count % 2) == 0) {
-    std::cerr<<"This program needs 6 or more arguments:\n";
-    std::cerr<<"\t"<<arg_vector[0]<<" [<aggregator ip> <aggregator port>]+ <world model ip> <solver port> <client port> <config file>\n\n";
-    std::cerr<<"Any number of server ip/port pairs may be provided to connect to multiple servers.\n";
+  if (5 > arg_count or (arg_count % 2) == 0) {
+    std::cerr<<"This program needs 4 arguments:\n";
+    std::cerr<<"\t"<<arg_vector[0]<<" <world model ip> <solver port> <client port> <config file>\n\n";
     std::cerr<<"Lines in the config file consist of the object class to track and the name of its switch status.\n";
     std::cerr<<"For instance: \"doors\" \"closed\"\n";
     return 0;
@@ -101,14 +100,6 @@ int main(int arg_count, char** arg_vector) {
 
   //Set up a signal handler to catch interrupt signals so we can close gracefully
   signal(SIGINT, handler);  
-
-  //Grab the ip and ports for the aggregators and world model
-  std::vector<SolverAggregator::NetTarget> servers;
-  for (int s_num = 1; s_num < arg_count - 4; s_num += 2) {
-    std::string server_ip(arg_vector[s_num]);
-    uint16_t server_port = std::stoi(std::string(arg_vector[s_num + 1]));
-    servers.push_back(SolverAggregator::NetTarget{server_ip, server_port});
-  }
 
   //World model IP and ports
   std::string wm_ip(arg_vector[arg_count - 4]);
@@ -126,8 +117,8 @@ int main(int arg_count, char** arg_vector) {
   //query to find all objects of interest.
   //Use the object to solution map to map transmitters to URIs
   std::map<std::u16string, std::u16string> object_to_solution;
-  std::map<pair<uint8_t, uint128_t>, URI> tx_to_uri;
-  std::mutex tx_to_uri_mutex;
+	//Map of transmitter URI (with binary data type) to object URIs.
+  std::map<URI, URI> tx_to_uri;
 
   std::ifstream config(arg_vector[arg_count-1]);
   if (not config.is_open()) {
@@ -142,12 +133,12 @@ int main(int arg_count, char** arg_vector) {
     if (is >> obj_class >> solution) {
       //Each switch value is a single byte for on or off but the
       //solution name for each object class is different.
-      //Safe this as a non-transient solution type
+      //Save this as a non-transient solution type
       //Change underlines into spaces.
       std::transform(obj_class.begin(), obj_class.end(), obj_class.begin(),
           [&](char c) { return c == '_' ? ' ' : c;});
       type_pairs.push_back(std::make_pair(toU16(solution), false));
-      std::cerr<<"Class \""<<obj_class<<"\" has solution name \""<<solution<<'\n';
+      std::cerr<<"Class \""<<obj_class<<"\" has solution name \""<<solution<<"\"\n";
       object_to_solution[toU16(obj_class)] = toU16(solution);
     }
     else {
@@ -168,65 +159,8 @@ int main(int arg_count, char** arg_vector) {
     return 0;
   }
 
-
-  //Subscription rules for the GRAIL aggregator
-  //The transmitters to request will be discovered from the world model
-  //We need to remember what transmitters we've already requested over here.
-  std::map<uint8_t, Rule> phy_to_rule;
+	//Remember switch states so that we only update 
   std::map<URI, bool> switch_state;
-
-  //Connect to the aggregator and update it with new rules as the world model
-  //provided transmitters of interest
-  auto packet_callback = [&](SampleData& s) {
-    if (s.valid and 1 == s.sense_data.size()) {
-      int switch_value = readPrimitive<uint8_t>(s.sense_data, 0);
-      if (0 == switch_value or 255 == switch_value) {
-        URI uri;
-        {
-          std::unique_lock<std::mutex> lck(tx_to_uri_mutex);
-          uri = tx_to_uri[std::make_pair(s.physical_layer, s.tx_id)];
-        }
-        bool switch_on = 255 == switch_value;
-        if (switch_state.end() == switch_state.find(uri) or switch_state[uri] != switch_on) {
-          switch_state[uri] = switch_on;
-          //Use the object to solution map to get the solution name.
-          for (auto obj_soln = object_to_solution.begin(); obj_soln != object_to_solution.end(); ++obj_soln) {
-            if (uri.find(u"." + obj_soln->first + u".") != std::u16string::npos) {
-              SolverWorldModel::AttrUpdate soln{obj_soln->second, world_model::getGRAILTime(), uri, std::vector<uint8_t>()};
-              pushBackVal<uint8_t>(switch_on ? 1 : 0, soln.data);
-              std::vector<SolverWorldModel::AttrUpdate> solns{soln};
-              //Send the data to the world model
-              bool retry = true;
-              while (retry) {
-                try {
-                  retry = false;
-                  swm.sendData(solns, false);
-                }
-                catch (std::runtime_error& err) {
-                  //Retry if this is just 
-                  if (err.what() == std::string("Error sending data over socket: Resource temporarily unavailable")) {
-                    std::cerr<<"Experiencing socket slow down with world model connection. Retrying...\n";
-                    retry = true;
-                  }
-                  //Otherwise keep throwing
-                  else {
-                    throw err;
-                  }
-                }
-              }
-              if (switch_on) {
-                std::cout<<toString(uri)<<" is "<<toString(obj_soln->second)<<'\n';
-              } else {
-                std::cout<<toString(uri)<<" is not "<<toString(obj_soln->second)<<'\n';
-              }
-            }
-          }
-        }
-      }
-    }
-  };
-  SolverAggregator aggregator(servers, packet_callback);
-
 
   //Now handle connecting as a client.
   //Search for any IDs with names <anything>.obj_class.<anything>
@@ -246,94 +180,129 @@ int main(int arg_count, char** arg_vector) {
     desired_ids += u")\\..*";
   }
 
-  //Search for any matching IDs with switch sensors
-  std::vector<URI> attributes{u"sensor.switch.*"};
-  //Update at most once a second
-  world_model::grail_time interval = 1000;
-  //We will connect to the world model as a client inside of the processing loop below
-  //Whenever we are disconnected we will attempt to reconnect.
+  //Search for sensors attributes of any matching IDs
+  std::vector<URI> attributes{u"sensor.*"};
+
+	//Update IDs one a second
+	world_model::grail_time interval = 1000;
+
+	//Set up parameters for a second request of 'binary state' data.
+	//Update as data arrives (interval of 0).
+	URI binary_ids = u".*";
+	std::vector<URI> binary_attributes{u"binary state"};
+	world_model::grail_time binary_interval = 1000;
+
+	//We will connect to the world model as a client inside of the processing loop below
+	//Whenever we are disconnected we will attempt to reconnect.
+
 
   std::cerr<<"Trying to connect to world model as a client.\n";
   ClientWorldConnection cwc(wm_ip, client_port);
+	//Send out the requests
+	StepResponse sr = cwc.streamRequest(desired_ids, attributes, interval);
+	StepResponse binary_response = cwc.streamRequest(binary_ids, binary_attributes, binary_interval);
 
+	std::cerr<<"Starting processing loop...\n";
   while (not interrupted) {
+		//Less than operator for two world model attributes
+		auto attr_comp = [](const Attribute& a, const Attribute& b) {
+			return (a.expiration_date != 0 or a.creation_date < b.creation_date); };
+		//Stay connected
     while (not cwc.connected() and not interrupted) {
       std::cerr<<"Waiting 4 seconds before attempting to reconnect client->world model connection\n";
       //Sleep for several seconds after an error before trying to reconnect
       sleep(4);
       cwc.reconnect();
+			if (cwc.connected()) {
+				//Re-send out the requests
+				StepResponse sr = cwc.streamRequest(desired_ids, attributes, interval);
+				StepResponse binary_response = cwc.streamRequest(binary_ids, binary_attributes, binary_interval);
+			}
     }
 
-    //Less than operator for two world model attributes
-    auto attr_comp = [](const Attribute& a, const Attribute& b) {
-      return (a.expiration_date != 0 or a.creation_date < b.creation_date); };
-    std::cerr<<"Starting processing loop...\n";
-    try {
-      StepResponse sr = cwc.streamRequest(desired_ids, attributes, interval);
-      while (sr.hasNext() and not interrupted) {
-        //Remember if we need to ask the aggregator for more information.
-        bool new_transmitters = false;
-        //Get world model updates
-        world_model::WorldState ws = sr.next();
-        //Check each object for switch sensor ID information
-        for (const std::pair<URI, std::vector<Attribute>>& I : ws) {
-          if (I.second.empty()) {
-            std::cerr<<toString(I.first)<<" is an empty object.\n";
-          }
-          else {
-            Attribute newest = *(std::max_element(I.second.begin(), I.second.end(), attr_comp));
-            if (newest.expiration_date != 0) {
-              //TODO FIXME This attribute has been expired so stop updating the
-              //status of this ID in the world model
-            }
-            //Otherwise, make sure that we have signed up for this sensor's data
-            //from the aggregators
+		try {
 
-            //Transmitters are stored as one byte of physical layer and 16 bytes of ID
-            grail_types::transmitter tx_switch = grail_types::readTransmitter(newest.data);
-            if (phy_to_rule.find(tx_switch.phy) == phy_to_rule.end()) {
-              phy_to_rule[tx_switch.phy].physical_layer  = tx_switch.phy;
-              phy_to_rule[tx_switch.phy].update_interval = 1000;
-            }
-            //See if this is a new transmitter
-            auto tx_present = [&](const Transmitter& tx) {return tx.base_id == tx_switch.id;};
+			//Now process the on-demand binary data
+			while (binary_response.hasNext() and not interrupted) {
+				//Get world model updates
+				world_model::WorldState ws = binary_response.next();
+				//Check each object for new switch states
+				for (const std::pair<URI, std::vector<Attribute>>& I : ws) {
+					if (tx_to_uri.end() != tx_to_uri.find(I.first)) {
+						URI uri = tx_to_uri[I.first];
+						//Get the first byte of the data (will be a one byte binary value)
+						bool switch_on = I.second[0].data.at(0);
+						if (switch_state.end() == switch_state.find(uri) or switch_state[uri] != switch_on) {
+							switch_state[uri] = switch_on;
+							//Use the object to solution map to get the solution name.
+							for (auto obj_soln = object_to_solution.begin(); obj_soln != object_to_solution.end(); ++obj_soln) {
+								if (uri.find(u"." + obj_soln->first + u".") != std::u16string::npos) {
+									SolverWorldModel::AttrUpdate soln{obj_soln->second, world_model::getGRAILTime(), uri, std::vector<uint8_t>()};
+									pushBackVal<uint8_t>(switch_on ? 1 : 0, soln.data);
+									std::vector<SolverWorldModel::AttrUpdate> solns{soln};
+									//Send the data to the world model
+									bool retry = true;
+									while (retry) {
+										try {
+											retry = false;
+											swm.sendData(solns, false);
+										}
+										catch (std::runtime_error& err) {
+											//Retry if this is just a temporary socket error
+											if (err.what() == std::string("Error sending data over socket: Resource temporarily unavailable")) {
+												std::cerr<<"Experiencing socket slow down with world model connection. Retrying...\n";
+												retry = true;
+											}
+											//Otherwise keep throwing
+											else {
+												throw err;
+											}
+										}
+									}
+									if (switch_on) {
+										std::cout<<toString(uri)<<" is "<<toString(obj_soln->second)<<'\n';
+									} else {
+										std::cout<<toString(uri)<<" is not "<<toString(obj_soln->second)<<'\n';
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+			//Check for responses to map sensors to object identifiers
+			while (sr.hasNext() and not interrupted) {
+				//Get world model updates
+				world_model::WorldState ws = sr.next();
+				//Check each object for switch sensor ID information
+				for (const std::pair<URI, std::vector<Attribute>>& I : ws) {
+					if (I.second.empty()) {
+						std::cerr<<toString(I.first)<<" is an empty object.\n";
+					}
+					else {
+						Attribute newest = *(std::max_element(I.second.begin(), I.second.end(), attr_comp));
+						if (newest.expiration_date != 0) {
+							//TODO FIXME This attribute has been expired so stop updating the
+							//status of this ID in the world model
+						}
+						//Otherwise, make sure that we have signed up for this sensor's data
+						//from the aggregators
 
-            std::vector<Transmitter>& phy_txers = phy_to_rule[tx_switch.phy].txers;
-            if (phy_txers.end() == std::find_if(phy_txers.begin(), phy_txers.end(), tx_present)) {
-              std::cerr<<"Requesting aggregator data for new transmitter "<<tx_switch.id<<" on device "<<toString(I.first)<<'\n';
-              //Mark that we are making a change to the aggregator rules.
-              new_transmitters = true;
-              //Only accept data from sensors that we care about
-              Transmitter sensor_id;
-              sensor_id.base_id = tx_switch.id;
-              sensor_id.mask.upper = 0xFFFFFFFFFFFFFFFF;
-              sensor_id.mask.lower = 0xFFFFFFFFFFFFFFFF;
-              phy_txers.push_back(sensor_id);
-              //Also map this transmitter's ID to the object it corresponds to in the world model
-              {
-                std::unique_lock<std::mutex> lck(tx_to_uri_mutex);
-                tx_to_uri[std::make_pair(tx_switch.phy, tx_switch.id)] = I.first;
-              }
-            }
-          }
-        }
-        //Make new subscriptions to the aggregator if there are new transmitters
-        if (new_transmitters) {
-          Subscription sub;
-          for (auto phy_rule : phy_to_rule) {
-            sub.push_back(phy_rule.second);
-          }
-          std::cerr<<"Sending new rules to the aggregator.\n";
-          aggregator.addRules(sub);
-        }
-        //Clear the phy_to_rule map since the solver aggregator interface
-        //now remembers this rule.
-        phy_to_rule.clear();
-      }
-    }
-    catch (std::runtime_error& err) {
-      std::cerr<<"Error in client->world model connection: "<<err.what()<<'\n';
-    }
+						//Transmitters are stored as one byte of physical layer and 16 bytes of ID
+						grail_types::transmitter tx_switch = grail_types::readTransmitter(newest.data);
+						//Map this transmitter to the ID of the object it corresponds to in the world model
+						std::string str = std::to_string(tx_switch.phy) + "." + std::to_string(tx_switch.id.lower);
+						tx_to_uri[std::u16string(str.begin(), str.end())] = I.first;
+						std::cerr<<"Adding "<<std::string(I.first.begin(), I.first.end())<<" into object map with transmitter "<<std::string(str)<<"\n";
+					}
+				}
+			}
+		}
+		catch (std::runtime_error& err) {
+			std::cerr<<"Error in client->world model connection: "<<err.what()<<'\n';
+		}
+		//Yield to allow the client world connection to run for a bit
+		std::this_thread::yield();
   }
 }
 
