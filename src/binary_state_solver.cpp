@@ -190,7 +190,7 @@ int main(int arg_count, char** arg_vector) {
 	//Update as data arrives (interval of 0).
 	URI binary_ids = u".*";
 	std::vector<URI> binary_attributes{u"binary state"};
-	world_model::grail_time binary_interval = 1000;
+	world_model::grail_time binary_interval = 0;
 
 	//We will connect to the world model as a client inside of the processing loop below
 	//Whenever we are disconnected we will attempt to reconnect.
@@ -301,8 +301,6 @@ int main(int arg_count, char** arg_vector) {
 		catch (std::runtime_error& err) {
 			std::cerr<<"Error in client->world model connection: "<<err.what()<<'\n';
 		}
-		//Yield to allow the client world connection to run for a bit
-		std::this_thread::yield();
   }
 }
 
