@@ -86,15 +86,17 @@ int main(int arg_count, char** arg_vector) {
     std::cout<< "arguments: worldmodel wm_solver wm_client config_file\n";
     std::cout<< "description: Monitors status of simple on/off switches.\n";
     std::cout<< "requires: 'binary state'\n";
-    std::cout<< "config_file: tuple* 2 An item class (eg. door) and the name for its state when the switch is on (eg. closed).\n";
     return 0;
   }
 
-  if (5 > arg_count or (arg_count % 2) == 0) {
+  if (4 > arg_count) {
     std::cerr<<"This program needs 4 arguments:\n";
-    std::cerr<<"\t"<<arg_vector[0]<<" <world model ip> <solver port> <client port> <config file>\n\n";
-    std::cerr<<"Lines in the config file consist of the object class to track and the name of its switch status.\n";
-    std::cerr<<"For instance: \"doors\" \"closed\"\n";
+		std::cerr<<"\t"<<arg_vector[0]<<" <world model ip> <solver port> <client port>\n\n";
+		std::cerr<<"This solver uses binary data from objects with attributes named ";
+		std::cerr<<"'sensor.door' and 'sensor.water'.\n";
+		std::cerr<<"An optional 4th argument may be an integer specifying the number of times a binary value\n";
+	  std::cerr<<"must be observed before a state change occurs. Use this to combat packet errors. Try setting\n";
+	  std::cerr<<"this to one less than the expected number of receivers that can see a transmitter's packet.\n";
     return 0;
   }
 
@@ -102,86 +104,45 @@ int main(int arg_count, char** arg_vector) {
   signal(SIGINT, handler);  
 
   //World model IP and ports
-  std::string wm_ip(arg_vector[arg_count - 4]);
-  int solver_port = std::stoi(std::string((arg_vector[arg_count - 3])));
-  int client_port = std::stoi(std::string((arg_vector[arg_count - 2])));
+  std::string wm_ip(arg_vector[1]);
+  int solver_port = std::stoi(std::string((arg_vector[2])));
+  int client_port = std::stoi(std::string((arg_vector[3])));
+	int transition_threshold = 1;
+	if (arg_count == 5) {
+		transition_threshold = std::stoi(std::string((arg_vector[4])));
+		std::cerr<<"Using a transition threshold of "<<transition_threshold<<'\n';
+	}
 
   //Set up the solver world model connection;
   std::string origin = "binary_state_solver";
-
-  //Read in type information from the config file
-  //Types for the GRAIL world model will be read from the file
-  std::vector<std::pair<std::u16string, bool>> type_pairs;
 
   //Remember what names correspond to what solutions and build a
   //query to find all objects of interest.
   //Use the object to solution map to map transmitters to URIs
   std::map<std::u16string, std::u16string> object_to_solution;
+	object_to_solution[u"sensor.door"] = u"closed";
+	object_to_solution[u"sensor.water"] = u"wet";
+
 	//Map of transmitter URI (with binary data type) to object URIs.
   std::map<URI, URI> tx_to_uri;
+  std::map<URI, std::u16string> tx_to_solution;
 
-  std::ifstream config(arg_vector[arg_count-1]);
-  if (not config.is_open()) {
-    std::cerr<<"Error opening configuration file \""<<arg_vector[arg_count-1]<<"\"\n";
-    return 1;
-  }
-  std::string line;
-  //Read in each type and its corresponding name
-  while (std::getline(config, line)) {
-    std::istringstream is(line);
-    std::string obj_class, solution;
-    if (is >> obj_class >> solution) {
-      //Each switch value is a single byte for on or off but the
-      //solution name for each object class is different.
-      //Save this as a non-transient solution type
-      //Change underlines into spaces.
-      std::transform(obj_class.begin(), obj_class.end(), obj_class.begin(),
-          [&](char c) { return c == '_' ? ' ' : c;});
-      type_pairs.push_back(std::make_pair(toU16(solution), false));
-      std::cerr<<"Class \""<<obj_class<<"\" has solution name \""<<solution<<"\"\n";
-      object_to_solution[toU16(obj_class)] = toU16(solution);
-    }
-    else {
-      std::cerr<<"Couldn't make sense of line: \""<<line<<"\"\n";
-    }
-  }
-  config.close();
-
-  if (object_to_solution.empty()) {
-    std::cerr<<"There are no types in the config file - aborting.\n";
-    return 1;
-  }
+  //Solution types for the world model.
+  std::vector<std::pair<std::u16string, bool>> solution_types{{u"closed", false}, {u"wet", false}};
 
   std::cerr<<"Trying to connect to world model as a solver.\n";
-  SolverWorldModel swm(wm_ip, solver_port, type_pairs, toU16(origin));
+  SolverWorldModel swm(wm_ip, solver_port, solution_types, toU16(origin));
   if (not swm.connected()) {
     std::cerr<<"Could not connect to the world model as a solver - aborting.\n";
     return 0;
   }
 
-	//Remember switch states so that we only update 
+	//Remember switch states so that we only update when something changes
   std::map<URI, bool> switch_state;
 
-  //Now handle connecting as a client.
-  //Search for any IDs with names <anything>.obj_class.<anything>
-  URI desired_ids = u".*\\.";
-  if (object_to_solution.size() == 1) {
-    desired_ids = u".*\\." + object_to_solution.begin()->first + u"\\..*";
-  }
-  else {
-    desired_ids += u"(";
-    for (auto I = object_to_solution.begin(); I != object_to_solution.end(); ++I) {
-      //Insert a | (OR in regex) into the regex if this isn't the first object
-      if (I != object_to_solution.begin()) {
-        desired_ids += u"|";
-      }
-      desired_ids += I->first;
-    }
-    desired_ids += u")\\..*";
-  }
-
-  //Search for sensors attributes of any matching IDs
-  std::vector<URI> attributes{u"sensor.*"};
+  //Search for sensor attributes of any matching IDs
+	URI desired_ids = u".*";
+  std::vector<URI> attributes{u"sensor.(door|water)"};
 
 	//Update IDs one a second
 	world_model::grail_time interval = 1000;
@@ -194,7 +155,6 @@ int main(int arg_count, char** arg_vector) {
 
 	//We will connect to the world model as a client inside of the processing loop below
 	//Whenever we are disconnected we will attempt to reconnect.
-
 
   std::cerr<<"Trying to connect to world model as a client.\n";
   ClientWorldConnection cwc(wm_ip, client_port);
@@ -224,47 +184,46 @@ int main(int arg_count, char** arg_vector) {
 
 			//Now process the on-demand binary data
 			while (binary_response.hasNext() and not interrupted) {
+				std::cerr<<"Got binary data\n";
 				//Get world model updates
 				world_model::WorldState ws = binary_response.next();
 				//Check each object for new switch states
 				for (const std::pair<URI, std::vector<Attribute>>& I : ws) {
 					if (tx_to_uri.end() != tx_to_uri.find(I.first)) {
 						URI uri = tx_to_uri[I.first];
+						std::u16string soln_name = tx_to_solution[I.first];
 						//Get the first byte of the data (will be a one byte binary value)
 						bool switch_on = I.second[0].data.at(0);
+						//Update if this is new or if the value changed
 						if (switch_state.end() == switch_state.find(uri) or switch_state[uri] != switch_on) {
 							switch_state[uri] = switch_on;
 							//Use the object to solution map to get the solution name.
-							for (auto obj_soln = object_to_solution.begin(); obj_soln != object_to_solution.end(); ++obj_soln) {
-								if (uri.find(u"." + obj_soln->first + u".") != std::u16string::npos) {
-									SolverWorldModel::AttrUpdate soln{obj_soln->second, world_model::getGRAILTime(), uri, std::vector<uint8_t>()};
-									pushBackVal<uint8_t>(switch_on ? 1 : 0, soln.data);
-									std::vector<SolverWorldModel::AttrUpdate> solns{soln};
-									//Send the data to the world model
-									bool retry = true;
-									while (retry) {
-										try {
-											retry = false;
-											swm.sendData(solns, false);
-										}
-										catch (std::runtime_error& err) {
-											//Retry if this is just a temporary socket error
-											if (err.what() == std::string("Error sending data over socket: Resource temporarily unavailable")) {
-												std::cerr<<"Experiencing socket slow down with world model connection. Retrying...\n";
-												retry = true;
-											}
-											//Otherwise keep throwing
-											else {
-												throw err;
-											}
-										}
+							SolverWorldModel::AttrUpdate soln{soln_name, world_model::getGRAILTime(), uri, std::vector<uint8_t>()};
+							pushBackVal<uint8_t>(switch_on ? 1 : 0, soln.data);
+							std::vector<SolverWorldModel::AttrUpdate> solns{soln};
+							//Send the data to the world model
+							bool retry = true;
+							while (retry) {
+								try {
+									retry = false;
+									swm.sendData(solns, false);
+								}
+								catch (std::runtime_error& err) {
+									//Retry if this is just a temporary socket error
+									if (err.what() == std::string("Error sending data over socket: Resource temporarily unavailable")) {
+										std::cerr<<"Experiencing socket slow down with world model connection. Retrying...\n";
+										retry = true;
 									}
-									if (switch_on) {
-										std::cout<<toString(uri)<<" is "<<toString(obj_soln->second)<<'\n';
-									} else {
-										std::cout<<toString(uri)<<" is not "<<toString(obj_soln->second)<<'\n';
+									//Otherwise keep throwing
+									else {
+										throw err;
 									}
 								}
+							}
+							if (switch_on) {
+								std::cout<<toString(uri)<<" is "<<toString(soln_name)<<'\n';
+							} else {
+								std::cout<<toString(uri)<<" is not "<<toString(soln_name)<<'\n';
 							}
 						}
 					}
@@ -272,6 +231,7 @@ int main(int arg_count, char** arg_vector) {
 			}
 			//Check for responses to map sensors to object identifiers
 			while (sr.hasNext() and not interrupted) {
+				std::cerr<<"Got sensor name data\n";
 				//Get world model updates
 				world_model::WorldState ws = sr.next();
 				//Check each object for switch sensor ID information
@@ -281,19 +241,27 @@ int main(int arg_count, char** arg_vector) {
 					}
 					else {
 						Attribute newest = *(std::max_element(I.second.begin(), I.second.end(), attr_comp));
-						if (newest.expiration_date != 0) {
-							//TODO FIXME This attribute has been expired so stop updating the
-							//status of this ID in the world model
-						}
-						//Otherwise, make sure that we have signed up for this sensor's data
-						//from the aggregators
 
 						//Transmitters are stored as one byte of physical layer and 16 bytes of ID
 						grail_types::transmitter tx_switch = grail_types::readTransmitter(newest.data);
-						//Map this transmitter to the ID of the object it corresponds to in the world model
 						std::string str = std::to_string(tx_switch.phy) + "." + std::to_string(tx_switch.id.lower);
-						tx_to_uri[std::u16string(str.begin(), str.end())] = I.first;
-						std::cerr<<"Adding "<<std::string(I.first.begin(), I.first.end())<<" into object map with transmitter "<<std::string(str)<<"\n";
+						std::u16string tx_str = std::u16string(str.begin(), str.end());
+						if (newest.expiration_date != 0) {
+							//This attribute has been expired so stop updating the
+							//status of this ID in the world model
+							tx_to_uri.erase(tx_str);
+							tx_to_solution.erase(tx_str);
+						}
+						else {
+							//Otherwise, make sure that we have signed up for this sensor's data
+							//from the aggregators
+
+							//Map this transmitter to the ID of the object it corresponds to in the world model
+							tx_to_uri[tx_str] = I.first;
+							//Map this transmitter ID to a solution type from its attribute name
+							tx_to_solution[tx_str] = object_to_solution[newest.name];
+							std::cerr<<"Adding "<<std::string(I.first.begin(), I.first.end())<<" into object map with transmitter "<<std::string(str)<<"\n";
+						}
 					}
 				}
 			}
