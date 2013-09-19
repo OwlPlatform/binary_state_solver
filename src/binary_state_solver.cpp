@@ -184,7 +184,6 @@ int main(int arg_count, char** arg_vector) {
 
 			//Now process the on-demand binary data
 			while (binary_response.hasNext() and not interrupted) {
-				std::cerr<<"Got binary data\n";
 				//Get world model updates
 				world_model::WorldState ws = binary_response.next();
 				//Check each object for new switch states
